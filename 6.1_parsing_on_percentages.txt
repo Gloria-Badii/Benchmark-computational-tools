@@ -1,0 +1,538 @@
+
+
+
+
+
+##########################     PREPARING THE LISTS FOR FILTERING UNWANTED GENERA   ##############
+
+######     KAIJU
+
+# using the summary from scrit 5 with the full linage
+cat Kaiju_output/kaiju_classif_summary_full.tsv | grep -E "Eukaryota|Archaea|Viruses" > Kaiju_output/list_Kaiju_to_filter.tsv
+# keeping the last three fields to ensure to catch the genus
+awk -F";" '{if (NF >= 3) print $(NF-2) "\n" $(NF-1) "\n" $NF}' Kaiju_output/list_Kaiju_to_filter.tsv | sed '/^$/d' > Kaiju_output/list_Kaiju_filtered.tmp
+mv Kaiju_output/list_Kaiju_filtered.tmp Kaiju_output/list_Kaiju_to_filter.tsv
+
+
+######     KRAKEN
+
+kraken_db='/media/matteo/SSD4/reference/kraken2_core_nt_db_v20241228/'
+# kraken2-inspect --db $kraken_db --use-mpa-style --threads $threads > $kraken_db/kraken2_to_full_path.tsv
+
+grep "d__Eukar" $kraken_db/kraken2_to_full_path.tsv | grep "g__" | sed -e "s/.*g__//g" -e "s/|.*//g" | cut -f 1 | sort |uniq > kraken_output/list_of_genera_not_proka.txt
+grep "d__Viruses" $kraken_db/kraken2_to_full_path.tsv | grep "g__" | sed -e "s/.*g__//g" -e "s/|.*//g" | cut -f 1 | sort | uniq >> kraken_output/list_of_genera_not_proka.txt
+grep "d__Archaea" $kraken_db/kraken2_to_full_path.tsv | grep "g__" | sed -e "s/.*g__//g" -e "s/|.*//g" | cut -f 1 | sort | uniq >> kraken_output/list_of_genera_not_proka.txt
+
+
+#######   RIBOFRAME
+
+# preparing a list of genera of Archaea to filter out from riboFrame
+
+output_final="final_list_of_archaea.txt"   # defining the final destination
+
+# searching the genues belonging to Archaea domain in each output file from riboFrame, then collapsing with no repetition
+for dir in ./RiboFr_output/*/; do
+
+for file in "$dir"*.rdp; do #finds all the files ending in .rdp
+if [ -f "$file" ]; then
+echo "Processing $file"
+cat "$file" | grep "Archaea" | awk -F'\t' '{print $(NF-2)}' | sort | uniq > "$dir/list_of_archaea.txt"
+fi
+done
+done
+
+echo "Collapsing all the files in list_of_archaea.txt..."
+cat ./RiboFr_output/*/list_of_archaea.txt | sort | uniq > "$output_final"
+
+echo "The work is complete, the results are in $output_final"
+
+
+######    16S AMPLICON
+
+# searching the genera belonging to the Archaea in 16S amplicon output
+grep "d__Archaea" ./Obtained_Counts/true_16S_taxonomy.tsv | sed 's/; s__.*//' | awk -F';' '{print $NF}' | sort | uniq | sed '1,4d' | awk '{print $1}' > Archaea_16S.txt
+echo "NA_p_d__Archaea" >> Archaea_16S.txt  #adding manually where reached only domain level
+
+
+
+
+################    GATHERING ALL OBJECTS INTO A UNIQUE PLACE      ##################
+
+mkdir Obtained_Counts
+
+
+# exporting 16S counts
+conda activate qiime2-amplicon-2024.2
+qiime tools export --input-path QIIME/table.qza --output-path Obtained_Counts
+qiime tools export --input-path QIIME/taxonomy_SILVA.qza --output-path Obtained_Counts
+mv Obtained_Counts/taxonomy.tsv Obtained_Counts/true_16S_taxonomy.tsv
+biom convert -i Obtained_Counts/feature-table.biom -o Obtained_Counts/true_16S_counts.tsv --to-tsv
+sed -e "1d" -e "s/#OTU ID//g"  -i Obtained_Counts/true_16S_counts.tsv
+rm Obtained_Counts/feature-table.biom
+conda deactivate
+
+
+cp kraken_output/*bracken_abund_Genus* Obtained_Counts/    # from Kraken2
+cp RiboFr_output/*/*genus.cnt Obtained_Counts/          # from RiboFrame (full and V3-V4)
+cp Kaiju_output/kaiju_classif_summary.tsv Obtained_Counts/  # from Kiaju 
+  
+
+
+
+##################       PARSING       ##################
+  
+  R           # opening R
+
+library(reshape2)
+options(scipen=100)
+
+
+#### custom function to import the tables from the classifiers in tables with the same format (rows=genera, columns=samples)
+
+Import_from_Tot_Seq<- function( input_folder , table_suffix , column_tax , column_abund ) {
+  
+  # input_folder= folder in which search the objects (include the / in the folder path)
+  # table_suffix= suffix which the files (tsv) to import have in common
+  # column_tax= the name of the taxonomy column in such files
+  # column_abund= abundance column
+  
+  files_to_import<-dir(input_folder)
+  files_to_import<- files_to_import[grep(table_suffix, files_to_import, fixed=T)]
+  files_list<-list()
+  for( i in 1:length(files_to_import) ) {
+    files_list[[i]]<- as.data.frame(read.table( paste0(input_folder , files_to_import[i]) , sep="\t", header = T, dec = ".", quote="") )
+  }
+  names(files_list)<-gsub(table_suffix, "", files_to_import)
+  # NB: uncleaned file names can cause problem with the unclassified count (due to the row name matching used afterward)
+  # joining every report to a temporary unique table for the script (to search for unique bacteria in every assignment and then creating the related row)
+  complete_table<-NULL
+  for(i in 1:length(files_list)){
+    new_sample<-cbind.data.frame(sample=names(files_list)[i], files_list[[i]]) # sample name (repeated along the column) with the related results
+    # kraken2 core_nt gives few duplicated entries sometime! Solving it by adding the tax id...
+    if( grepl("bracken",table_suffix) ) {
+      duplicated_entries <- duplicated(new_sample$name)
+      new_sample$name[ duplicated_entries ] <- paste0(new_sample$name[ duplicated_entries ] , "_taxID", new_sample$taxonomy_id[ duplicated_entries ] )
+    }
+    complete_table<-rbind.data.frame(complete_table, new_sample)
+  }
+  
+  colnames(complete_table)[colnames(complete_table)== column_tax ]<-"Bacterium"
+  colnames(complete_table)[colnames(complete_table)==column_abund ]<-"Abundance"  # selecting the estimation by bracken as abundance
+  
+  
+  # from list (each sample is repeated along a column) to feature table (each sample is a column)
+  feature_table<-cbind("Temp_column"=unique(complete_table$Bacterium))
+  # each bacterium in a row --> every bacterium in this table --> searching across samples --> if absent then 0
+  for( s in 1:length(unique(complete_table$sample) )) {  # NB: the numeric index is required to deal with the column name afterward!
+    sample<- unique(complete_table$sample)[s] # 1 sample at time
+    table_4_that_sample<- complete_table[complete_table$sample==sample , ]
+    abundances<-NULL # resets the vector, ready for the next bacterium
+    for( b in unique(complete_table$Bacterium)) {
+      # scan each bacterium in order: if found in that sample then appends the correspective abundances, if absent paste a 0
+      if( b %in% table_4_that_sample$Bacterium ){
+        abundances<-c(abundances, table_4_that_sample[ table_4_that_sample$Bacterium==b, "Abundance"])
+      } else {
+        abundances<-c(abundances, 0 ) # that bacterium is absent --> zero
+      }
+    }
+    feature_table<-cbind.data.frame(feature_table, abundances)
+    colnames(feature_table)[s+1] <- sample   # the +1 is for first column, which is temporarily the taxonomy column
+  }
+  colnames(feature_table)[ colnames(feature_table)=="Temp_column" ] <- "Genus"
+  table_obtained <<- feature_table
+  print("The imported counts are now stored in the object 'table_obtained' available in your main R scope\n")
+}
+
+
+
+### import from RiboFrame (full counts)
+Import_from_Tot_Seq(input_folder="Obtained_Counts/", table_suffix="_full_count.genus.cnt", column_tax="Name", column_abund="Perc" )
+Counts_RiboF_full<-table_obtained
+row.names(Counts_RiboF_full)<-Counts_RiboF_full$Genus
+
+### import from RiboFrame (V3-V4)
+Import_from_Tot_Seq(input_folder="Obtained_Counts/", table_suffix="_V3_V4.genus.cnt", column_tax="Name", column_abund="Perc" )
+Counts_RiboF_V3V4<-table_obtained
+row.names(Counts_RiboF_V3V4)<-Counts_RiboF_V3V4$Genus
+
+### import from Kraken2
+Import_from_Tot_Seq(input_folder="Obtained_Counts/", table_suffix="_bracken_abund_Genus", column_tax="name", column_abund="new_est_reads" )
+Counts_Kraken<-table_obtained
+row.names(Counts_Kraken)<-Counts_Kraken$Genus
+
+
+
+
+
+#################   TAXONOMY ADJUSTMENTS       #################
+
+# working on 16S feature table
+true_16_count<- read.table(file="Obtained_Counts/true_16S_counts.tsv", sep="\t", row.names=1, header=T)
+true_16_tax<- read.table(file="Obtained_Counts/true_16S_taxonomy.tsv", sep="\t", header=T)
+true_16_tax<-true_16_tax[ , c(1,2)]   # removing the confidence column
+true_16_tax$Taxon<-gsub("; s__.*","",true_16_tax$Taxon)   # removing info about species
+no_genus_classif<- ! grepl("g__", true_16_tax$Taxon )    # annotating where the classifier did not reach the genus level
+no_fam_classif<- ! grepl("f__", true_16_tax$Taxon )    # and where did not reach the family either
+phylum<-gsub(".*p__","", true_16_tax$Taxon)
+phylum<-gsub(";.*","", phylum)
+family<-gsub(".*f__","", true_16_tax$Taxon)
+family<-gsub(";.*","", family)
+genus <-  true_16_tax$Taxon
+genus[ no_genus_classif ] <- "NA"
+genus<-gsub(".*g__","", genus)
+genus<-gsub(";.*","", genus)
+# adding more info where required
+genus_new <- genus
+genus_new [ genus %in% c("NA","uncultured") ]<- paste0(genus[genus %in% c("NA","uncultured")] , "_f_", family[genus %in% c("NA","uncultured")] )
+# cleaning where there is not info at family level either (e.g. "NA_f_NA")
+genus_new [ grepl("_f_uncultured", genus_new) | no_fam_classif ] <- gsub("_f_.*","", genus_new [ grepl("_f_uncultured", genus_new) | no_fam_classif ] )
+# if the genus name is just "NA" or "uncultered" again then the family name was also missing... then adding the phylum name instead
+genus_new [ genus %in% c("NA","uncultured") ]<- paste0(genus[genus %in% c("NA","uncultured")] , "_p_", phylum[genus %in% c("NA","uncultured")] )
+true_16_tax$Taxon<-genus_new   # updating
+# creating a unique 16S table
+true_16_count <- true_16_count[ true_16_tax$Feature.ID , ]   # NB: same observation order
+Counts_true_16<-cbind.data.frame(true_16_count , "Genus"=true_16_tax$Taxon )
+Counts_true_16 <- aggregate( .~Genus, Counts_true_16, FUN= sum ) # aggregating at Genus level
+row.names(Counts_true_16)<- Counts_true_16$Genus
+
+
+
+# working on Kaiju table
+kaiju_count <- read.table(file="Kaiju_output/kaiju_classif_summary.tsv", sep="\t", header=T)
+kaiju_count <- kaiju_count[ , c(1,2,5)]
+kaiju_wide <- dcast(kaiju_count, taxon_name ~ file, value.var = "percent", fun.aggregate = function(x) x[1])
+kaiju_wide[is.na(kaiju_wide)] <- 0 
+row.names(kaiju_wide) <- kaiju_wide$taxon_name
+
+
+
+
+### translating names between SILVA and NCBI (at least the most abundant)
+total_16S <- rowSums( Counts_true_16[ , colnames(Counts_true_16)!="Genus" ])
+total_16S <- sort(total_16S, decreasing=TRUE)
+top_16S <- names( total_16S [1:50] )
+Counts_Kraken$Genus <- gsub("Candidatus ","Candidatus_", Counts_Kraken$Genus)
+top_Kraken <- names( sort (rowSums( Counts_Kraken[, colnames(Counts_Kraken)!="Genus"] ), decreasing=TRUE ) ) [1:50]
+top_Kraken <-gsub(" ", "_", top_Kraken)
+unique_names_Kraken <- top_Kraken [!top_Kraken %in% top_16S ]
+unique_names_SILVA <- top_16S [!top_16S %in% top_Kraken ] 
+# different "tops" between the two database ... but, maybe, the few of these names are still featured in the other object, only with smaller counts...
+unique_names_Kraken <- unique_names_Kraken[ ! unique_names_Kraken%in% Counts_true_16$Genus ]
+unique_names_SILVA<- unique_names_SILVA[ ! unique_names_SILVA%in% Counts_Kraken$Genus ]
+
+
+
+
+### solving the different names where possible through gsub in Kraken
+# adding from the species level output in the previous script...
+Counts_Kraken$Genus <- gsub("Nostocoides","Tetrasphaera", Counts_Kraken$Genus ) 
+Counts_Kraken$Genus <- gsub("Candidatus_Moraniibacteriota bacterium","Candidatus_Moranbacteria", Counts_Kraken$Genus )
+Counts_Kraken$Genus <- gsub("Candidatus_Kaiserbacteria bacterium","Candidatus_Kaiserbacteria", Counts_Kraken$Genus )
+Counts_Kraken$Genus <- gsub("Candidatus_Nomurabacteria bacterium","Candidatus_Nomurabacteria", Counts_Kraken$Genus )
+# the SILVA genus SH-PL14 has an NCBI taxID 1632864 according to MIDAS, which corresponds to the "missing" genus of the species "Planctomyces sp. SH-PL14"
+Counts_Kraken$Genus <- gsub("Planctomyces sp. SH-PL14","SH-PL14", Counts_Kraken$Genus )
+# the SILVA genus IMCC26207 has the NCBI code "1641811" according to MIDAS --> corresponds to the "missing" genus of the species Actinobacteria bacterium IMCC26207
+# the SILVA genus 67-14 corresponds to the "missing" genus of the species Solirubrobacterales bacterium 67-14 on NBCI
+Counts_Kraken$Genus <- gsub("Solirubrobacterales bacterium","67-14", Counts_Kraken$Genus )
+# the SILVA genus 37-13 corresponds to the "missing" genus of the species Bacteroidetes bacterium 37-13
+# Bdellovibrio, Lentimicrobium and Prosthecobacter are actually also in NCBI, they are just not featured in the Kraken dataset 
+# "Pir4 lineage" (of Pirellulaceae) is feautured in both SILVA and MIDAS but it is not in NCBI at all!
+# "SM1A02" does not exist on NCBI either...
+# codes such as "1-20"  are not found in NCBI...
+Counts_Kraken$Genus <- gsub("Gracilibacteria","Altimarinota", Counts_Kraken$Genus ) 
+
+
+
+
+
+#### solving the different names where possible (through gsub), in Kaiju
+
+kaiju_wide$taxon_name <- gsub("Candidatus_Moranbacteria bacterium","Candidatus_Moranbacteria", kaiju_wide$taxon_name )
+kaiju_wide$taxon_name <- gsub("Candidatus_Kaiserbacteria bacterium","Candidatus_Kaiserbacteria", kaiju_wide$taxon_name )
+kaiju_wide$taxon_name <- gsub("Candidatus_Nomurabacteria bacterium","Candidatus_Nomurabacteria", kaiju_wide$taxon_name )
+kaiju_wide$taxon_name <- gsub("Planctomyces sp. SH-PL14","SH-PL14", kaiju_wide$taxon_name )
+kaiju_wide$taxon_name <- gsub("Solirubrobacterales bacterium","67-14", kaiju_wide$taxon_name )
+
+
+
+
+
+################    REMOVING EUCARIOTES, VIRUSES AND ARCHAEA
+
+
+#using the lists previously prepared
+
+#noting down the number of genera before removing and filtering, without the mock
+sub_Kraken <- Counts_Kraken[, !grepl("mock", colnames(Counts_Kraken))]  #remove the mock
+sub_Kraken <- sub_Kraken[rowSums(sub_Kraken != 0) > 0, ]  
+genera_Kraken <- nrow(sub_Kraken)  #counting the number of genera for the only waste water samples
+
+sub_RiboF_V3V4 <- Counts_RiboF_V3V4[, !grepl("mock", colnames(Counts_RiboF_V3V4))]  
+sub_RiboF_V3V4 <- sub_RiboF_V3V4[rowSums(sub_RiboF_V3V4 != 0) > 0, ] 
+genera_RiboF_V3V4 <- nrow(sub_RiboF_V3V4)
+
+sub_RiboF_Full <- Counts_RiboF_full[, !grepl("mock", colnames(Counts_RiboF_full))]  
+sub_RiboF_Full <- sub_RiboF_Full[rowSums(sub_RiboF_Full != 0) > 0, ]  
+genera_RiboF_Full <- nrow(sub_RiboF_Full)
+
+genera_16S <- nrow(Counts_true_16)
+
+genera_kaiju <- nrow(kaiju_wide)
+
+
+### removing the eukaryotes, Archaea and viruses from kraken2 
+nope<- read.delim(file= "kraken_output/list_of_genera_not_proka.txt", col.names=F)
+nope<-nope[[1]]
+Counts_Kraken<- Counts_Kraken[! Counts_Kraken$Genus %in% nope , ]
+Counts_Kraken<- Counts_Kraken[! grepl("virus", Counts_Kraken$Genus), ]
+
+##removing Archaea from riboFrame
+nope_r<- read.delim(file= "final_list_of_archaea.txt", col.names=F)
+nope_r<- nope_r[[1]]
+Counts_RiboF_V3V4<- Counts_RiboF_V3V4[! Counts_RiboF_V3V4$Genus %in% nope_r , ]
+Counts_RiboF_full<- Counts_RiboF_full[! Counts_RiboF_full$Genus %in% nope_r , ]
+
+#removing "Mitochondria" from riboFrame
+Counts_RiboF_V3V4<- Counts_RiboF_V3V4[! grepl("Incertae_Sedis_f_Mitochondria", Counts_RiboF_V3V4$Genus) , ]
+Counts_RiboF_full<- Counts_RiboF_full[! grepl("Incertae_Sedis_f_Mitochondria", Counts_RiboF_full$Genus) , ]
+
+#removing Archaea from 16S
+nope_s<- read.delim(file= "Archaea_16S.txt", col.names=F)
+nope_s<- nope_s[[1]]
+Counts_true_16<- Counts_true_16[! Counts_true_16$Genus %in% nope_s , ]
+
+### removing the eukaryotes and Archaea from kaiju
+kaiju_wide<- kaiju_wide[! kaiju_wide$taxon_name %in% nope , ]  # to be sure, filtering also with kraken db 
+nope_k<- read.delim(file= "Kaiju_output/list_Kaiju_to_filter.tsv", col.names=F)
+nope_k<- nope_k[[1]]
+kaiju_wide<- kaiju_wide[! kaiju_wide$taxon_name %in% nope_k , ]
+
+#removing viruses from Kaiju
+kaiju_wide <- kaiju_wide[!grepl("Viruses", kaiju_wide$taxon_name, ignore.case = TRUE), ]
+
+
+
+
+
+#note down the number of genera after removing eucariotes, viruses and Archaea, without the mock
+sub_Kraken <- Counts_Kraken[, !grepl("mock", colnames(Counts_Kraken))]  #remove the mock
+sub_Kraken <- sub_Kraken[rowSums(sub_Kraken != 0) > 0, ]  
+Kraken_removing <- nrow(sub_Kraken)  #counting the number of genera for the only waste water samples
+
+sub_RiboF_V3V4 <- Counts_RiboF_V3V4[, !grepl("mock", colnames(Counts_RiboF_V3V4))]  
+sub_RiboF_V3V4 <- sub_RiboF_V3V4[rowSums(sub_RiboF_V3V4 != 0) > 0, ] 
+RiboF_V3V4_removing <- nrow(sub_RiboF_V3V4)
+
+sub_RiboF_Full <- Counts_RiboF_full[, !grepl("mock", colnames(Counts_RiboF_full))]  
+sub_RiboF_Full <- sub_RiboF_Full[rowSums(sub_RiboF_Full != 0) > 0, ]  
+RiboF_Full_removing <- nrow(sub_RiboF_Full)
+
+true_16s_removing <- nrow(Counts_true_16)
+
+kaiju_removing <- nrow(kaiju_wide)
+
+
+
+
+
+
+
+#############       FILTERING  and converting to PERCENTAGES
+
+
+Counts_Kraken[ , !colnames(Counts_Kraken)%in%"Genus"]<-apply( Counts_Kraken[ , !colnames(Counts_Kraken)%in%"Genus"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+Counts_true_16[ , !colnames(Counts_true_16)%in%"Genus"]<-apply( Counts_true_16[ , !colnames(Counts_true_16)%in%"Genus"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+kaiju_wide[ , !colnames(kaiju_wide)%in%"taxon_name"]<-apply( kaiju_wide[ , !colnames(kaiju_wide)%in%"taxon_name"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+# RiboFrame counts are already in percentages...
+
+
+# Filtering (while they are separated datasets) ...
+filter_threshold <- 0.005
+Counts_true_16 <- Counts_true_16[ rowMeans( Counts_true_16[ , !colnames(Counts_true_16)%in%"Genus"] ) > filter_threshold , ] 
+Counts_RiboF_V3V4 <- Counts_RiboF_V3V4[ rowMeans( Counts_RiboF_V3V4[ , !colnames(Counts_RiboF_V3V4)%in%"Genus"] ) > filter_threshold , ] 
+Counts_RiboF_full <- Counts_RiboF_full[ rowMeans( Counts_RiboF_full[ , !colnames(Counts_RiboF_full)%in%"Genus"] ) > filter_threshold , ] 
+kaiju_wide <- kaiju_wide[ rowMeans( kaiju_wide[ , !colnames(kaiju_wide)%in%"taxon_name"] ) > filter_threshold , ] 
+
+
+
+# in Kraken, the mock and the true samples are treated as two different datasets while filtering
+
+# overwriting these low counts with 0
+Counts_Kraken[ rowMeans(Counts_Kraken[,!colnames(Counts_Kraken)%in%c("Genus","mock_AGS_DNAseq.tsv")]) < filter_threshold , !colnames(Counts_Kraken)%in%c("Genus","mock_AGS_DNAseq.tsv") ] <- 0
+Counts_Kraken[  Counts_Kraken$"mock_AGS_DNAseq.tsv" < filter_threshold , "mock_AGS_DNAseq.tsv" ] <- 0      # overwriting the low counts of the mock only
+Counts_Kraken <- Counts_Kraken[ rowSums(Counts_Kraken[ , !colnames(Counts_Kraken)%in%"Genus"] ) > 0 , ]   # every row with only zeros is discarded
+# same in RiboF ...
+Counts_RiboF_V3V4[ rowMeans(Counts_RiboF_V3V4[,!colnames(Counts_RiboF_V3V4)%in%c("Genus","mock_AGS_DNAseq")]) < filter_threshold , !colnames(Counts_RiboF_V3V4)%in%c("Genus","mock_AGS_DNAseq") ] <- 0
+#Counts_RiboF_V3V4[  Counts_RiboF_V3V4$"mock_AGS_DNAseq" < filter_threshold , "mock_AGS_DNAseq" ] <- 0      # overwriting the low counts of the mock only
+Counts_RiboF_V3V4 <- Counts_RiboF_V3V4[ rowSums(Counts_RiboF_V3V4[ , !colnames(Counts_RiboF_V3V4)%in%"Genus"] ) > 0 , ]   # every row with only zeros is discarded
+Counts_RiboF_full[ rowMeans(Counts_RiboF_full[,!colnames(Counts_RiboF_full)%in%c("Genus","mock_AGS_DNAseq")]) < filter_threshold , !colnames(Counts_RiboF_full)%in%c("Genus","mock_AGS_DNAseq") ] <- 0
+#Counts_RiboF_full[  Counts_RiboF_full$"mock_AGS_DNAseq" < filter_threshold , "mock_AGS_DNAseq" ] <- 0      # overwriting the low counts of the mock only
+Counts_RiboF_full <- Counts_RiboF_full[ rowSums(Counts_RiboF_full[ , !colnames(Counts_RiboF_full)%in%"Genus"] ) > 0 , ]   # every row with only zeros is discarded
+
+
+
+# Re-computing the percentages after the filters
+Counts_Kraken[ , !colnames(Counts_Kraken)%in%"Genus"]<-apply( Counts_Kraken[ , !colnames(Counts_Kraken)%in%"Genus"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+Counts_true_16[ , !colnames(Counts_true_16)%in%"Genus"]<-apply( Counts_true_16[ , !colnames(Counts_true_16)%in%"Genus"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+Counts_RiboF_V3V4[ , !colnames(Counts_RiboF_V3V4)%in%"Genus"]<-apply( Counts_RiboF_V3V4[ , !colnames(Counts_RiboF_V3V4)%in%"Genus"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+Counts_RiboF_full[ , !colnames(Counts_RiboF_full)%in%"Genus"]<-apply( Counts_RiboF_full[ , !colnames(Counts_RiboF_full)%in%"Genus"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+kaiju_wide[ , !colnames(kaiju_wide)%in%"taxon_name"]<-apply( kaiju_wide[ , !colnames(kaiju_wide)%in%"taxon_name"] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )
+
+
+
+# Rounding
+Counts_Kraken[ , !colnames(Counts_Kraken)%in%"Genus"]<- round( Counts_Kraken[ , !colnames(Counts_Kraken)%in%"Genus"] , 4 )
+Counts_true_16[ , !colnames(Counts_true_16)%in%"Genus"]<- round( Counts_true_16[ , !colnames(Counts_true_16)%in%"Genus"] , 4 )
+Counts_RiboF_V3V4[ , !colnames(Counts_RiboF_V3V4)%in%"Genus"]<- round( Counts_RiboF_V3V4[ , !colnames(Counts_RiboF_V3V4)%in%"Genus"] , 4 )
+Counts_RiboF_full[ , !colnames(Counts_RiboF_full)%in%"Genus"]<- round( Counts_RiboF_full[ , !colnames(Counts_RiboF_full)%in%"Genus"] , 4 )
+kaiju_wide[ , !colnames(kaiju_wide)%in%"taxon_name"]<- round( kaiju_wide[ , !colnames(kaiju_wide)%in%"taxon_name"] , 4 )
+
+
+
+
+#########    NEW COLNAMES 
+
+
+codes<- c("X1510023F1498733"="16Strue_Lab", "X1621223F1607793"="16Strue_T1",
+          "X1621235F1607805"="16Strue_T2", "X1623017F1607817"="16Strue_T3",
+          "X1623038F1607838"="16Strue_T4")
+colnames(Counts_true_16)<- c("Genus", codes [ colnames(Counts_true_16)[colnames(Counts_true_16)!="Genus"] ] )
+
+codes<- c("1623909_S50.tsv"="Kraken_Lab", "1623905_S46.tsv"="Kraken_T1",
+          "1623906_S47.tsv"="Kraken_T2", "1623907_S48.tsv"="Kraken_T3",
+          "1623908_S49.tsv"="Kraken_T4",
+          "mock_AGS_DNAseq.tsv"="Kraken_Mock")
+colnames(Counts_Kraken)<- c("Genus", codes [ colnames(Counts_Kraken)[colnames(Counts_Kraken)!="Genus"] ] )
+
+codes<- c("1623909_S50"="RiboFull_Lab",
+          "mock_AGS_DNAseq"="RiboFull_Mock",  
+          "1623905_S46"="RiboFull_T1",
+          "1623906_S47"="RiboFull_T2", "1623907_S48"="RiboFull_T3",
+          "1623908_S49"="RiboFull_T4"
+)
+colnames(Counts_RiboF_full) <- c( "Genus", codes [ colnames(Counts_RiboF_full)[colnames(Counts_RiboF_full)!="Genus"] ] )
+
+codes<- c("1623909_S50"="RiboV3V4_Lab",
+          "mock_AGS_DNAseq"="RiboV3V4_Mock",
+          "1623905_S46"="RiboV3V4_T1",
+          "1623906_S47"="RiboV3V4_T2", "1623907_S48"="RiboV3V4_T3",
+          "1623908_S49"="RiboV3V4_T4"
+)
+colnames(Counts_RiboF_V3V4) <- c( "Genus", codes [ colnames(Counts_RiboF_V3V4)[colnames(Counts_RiboF_V3V4)!="Genus"] ] )
+
+codes<- c("1623909_S50_Kaiju"="Kaiju_Lab",
+          "mock_AGS_Kaiju"="Kaiju_Mock",
+          "1623905_S46_Kaiju"="Kaiju_T1",
+          "1623906_S47_Kaiju"="Kaiju_T2", "1623907_S48_Kaiju"="Kaiju_T3",
+          "1623908_S49_Kaiju"="Kaiju_T4"
+)
+colnames(kaiju_wide) <- c( "taxon_name", codes [ colnames(kaiju_wide)[colnames(kaiju_wide)!="taxon_name"] ] )
+
+
+
+
+
+
+
+
+###########        NOTE DOWN THE NUMBER of genera before removing Eu, Archaea, viruses + after filtering 0.005%
+
+
+#note down the number of genera after removing eucariotes, viruses and Archaea
+sub_Kraken <- Counts_Kraken[, !grepl("Mock", colnames(Counts_Kraken))]  #remove the mock
+sub_Kraken <- sub_Kraken[rowSums(sub_Kraken != 0) > 0, ]  
+Kraken_filtering <- nrow(sub_Kraken)  #counting the number of genera for the only waste water samples
+
+sub_RiboF_V3V4 <- Counts_RiboF_V3V4[, !grepl("Mock", colnames(Counts_RiboF_V3V4))]  
+sub_RiboF_V3V4 <- sub_RiboF_V3V4[rowSums(sub_RiboF_V3V4 != 0) > 0, ] 
+RiboF_V3V4_filtering <- nrow(sub_RiboF_V3V4)
+
+sub_RiboF_Full <- Counts_RiboF_full[, !grepl("Mock", colnames(Counts_RiboF_full))]  
+sub_RiboF_Full <- sub_RiboF_Full[rowSums(sub_RiboF_Full != 0) > 0, ]  
+RiboF_Full_filtering <- nrow(sub_RiboF_Full)
+
+sub_kaiju_wide <- kaiju_wide[, !grepl("Mock", colnames(kaiju_wide))]  
+sub_kaiju_wide <- sub_kaiju_wide[rowSums(sub_kaiju_wide != 0) > 0, ]  
+kaiju_filtering <- nrow(sub_kaiju_wide)
+
+true_16s_filtering <- nrow(Counts_true_16)
+
+
+
+
+
+numb_genera <- paste(
+  "Number of identified genera\n\n",
+  "Original number\tAfter removing\tAfter filtering\n",
+  "Kraken:", genera_Kraken, "\t", Kraken_removing, "\t", Kraken_filtering, "\n",
+  "RiboV3V4:", genera_RiboF_V3V4, "\t", RiboF_V3V4_removing, "\t", RiboF_V3V4_filtering, "\n",
+  "RiboFull:", genera_RiboF_Full, "\t", RiboF_Full_removing, "\t", RiboF_Full_filtering, "\n",
+  "Kaiju:", genera_kaiju, "\t", kaiju_removing, "\t", kaiju_filtering, "\n",
+  "16S:", genera_16S, "\t", true_16s_removing, "\t", true_16s_filtering, "\n"
+)
+
+# saving 
+write.table(numb_genera, file = "numb_genera.tsv", sep = "\t", row.names = FALSE, col.names = FALSE)
+
+
+### parsing between programs (while adding the known "true" abundances of the mock)
+
+
+# importing the mock abundances
+
+#read.table(file="true_abundances_of_the_DNAmock.tsv", sep="\t",header = TRUE)
+#vero comando che devi usare, poi rimuovi questa linea
+
+table_mock <- read.delim(file="true_abundances_of_the_DNAmock.tsv", sep=" ", col.names= c("Genus", "Known_mock") , header= F )
+table_mock$Known_mock <-apply( table_mock [ ,  "Known_mock" , drop=F ] , MARGIN = 2, FUN= function(x) (x/sum(x))*100 )  # transform into %
+table_mock$Known_mock <- round( table_mock [ , "Known_mock" , drop=F ] , 4 )   # rounding
+
+#fixing colname for Kaiju table before parsing
+colnames(kaiju_wide)[colnames(kaiju_wide) == "taxon_name"] <- "Genus"
+
+
+files_list<- list( Counts_Kraken, Counts_RiboF_full, Counts_RiboF_V3V4, kaiju_wide, Counts_true_16 , table_mock )
+names(files_list) <-  c("Counts_Kraken", "Counts_RiboF_full", "Counts_RiboF_V3V4", "Counts_true_16" , "kaiju_wide", "table_mock" )
+every_entry<-NULL
+for (x in 1:length(files_list)) {
+  every_entry <- c(every_entry, files_list[[x]][["Genus"]])
+}
+# from list (each set_pipeline is repeated along a column) to feature table (each set_pipeline is a column)
+feature_table<-cbind("Temp_column"=unique(every_entry))
+# each bacterium in a row --> every bacterium in this table --> searching across datasets
+for( s in 1:length(files_list) ) {
+  set_pipeline<- names(files_list)[[s]]  # 1 set_pipeline at time
+  table_4_that_set_pipeline<- files_list[[s]]
+  abundances<-NULL  # resets the object, ready for the next bacterium
+  # an empty column to be filled with each sample...
+  temp_set_pipeline<- matrix( "temp", length(unique(every_entry)) , length(colnames(table_4_that_set_pipeline)) )
+  temp_set_pipeline <- as.data.frame( temp_set_pipeline )
+  temp_set_pipeline[ ,1] <- unique(every_entry)
+  for( b in unique(every_entry)) {
+    # scan each bacterium in order: if found in that set_pipeline then appends the correspective abundances, if absent paste a 0
+    if( b %in% table_4_that_set_pipeline$Genus ){
+      abundances<- as.numeric(table_4_that_set_pipeline[ table_4_that_set_pipeline$Genus==b, !colnames(table_4_that_set_pipeline)%in%"Genus"  ])   # NB: the entire ROW will be captured this time
+    } else {
+      abundances<- rep(0, length( colnames(table_4_that_set_pipeline)[!colnames(table_4_that_set_pipeline)%in%"Genus" ]) )  # that bacterium is absent --> a series of zero
+    }
+    temp_set_pipeline[ temp_set_pipeline$V1 == b , ] <- c(b , abundances)  # overwrite the "temp"s row with actual values
+  }
+  colnames(temp_set_pipeline)<- colnames(table_4_that_set_pipeline)
+  feature_table<-cbind.data.frame(feature_table, temp_set_pipeline)  # this adds the sample to the complete table
+}
+
+
+
+feature_table <- feature_table[ , ! colnames(feature_table) %in% "Genus" ]
+beasts <- feature_table$Temp_column  # this column correspond to another "Genus" column
+# NB: "apply" will delete the colnames, then the genera names will be assigned as row.names afterwards
+feature_table$Temp_column <- NULL
+feature_table<-as.data.frame(apply(feature_table, MARGIN=2, FUN= as.numeric))
+row.names(feature_table) <- beasts
+
+
+
+write.table(feature_table, file="Counts_from_every_pipeline.tsv", sep = "\t", quote=F, row.names = T, col.names = T)
+
+
+

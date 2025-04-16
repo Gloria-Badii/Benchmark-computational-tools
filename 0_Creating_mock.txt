@@ -1,0 +1,111 @@
+#################      DOWNLOADING THE REFERENCE GENOMES FROM NCBI
+
+# required: dataset, iss
+# to download the feature dataset as follows
+# curl -o datasets 'https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets'   
+# chmod +x datasets
+
+
+
+
+
+################   PREPAREING THE DIRECTORIES   ################
+
+
+mkdir Creating_mock_in_silico
+cd Creating_mock_in_silico
+
+
+
+
+###############    DOWNLOADING THE REFERENCE GENOMES   #############
+
+
+for x in  327159  221279 Zoogloea Dechloromonas Flavobacterium Propionivibrio Novosphingobium Tetrasphaera Thauera
+# 327159 is Candidatus Accumulibacter, 221279 is Candidatus Competibacter ... if writing their taxonomic names, the loop returns errors
+do
+echo "Downloading $x reference genome"
+datasets download genome taxon $x --reference --include genome  --assembly-version latest --exclude-atypical --filename genome_ref_$x
+done
+
+# adding Moranbacteria genomes from GenBank 
+datasets download genome accession GCA_002779725.1 --include genome --filename genome_ref_Moranbacteria_Species1 
+datasets download genome accession GCA_000995125.1 --include genome --filename genome_ref_Moranbacteria_Species2
+datasets download genome accession GCA_001001525.1 --include genome --filename genome_ref_Moranbacteria_Species3
+
+# unzipping files
+for x in $(ls | grep "genome_" )
+do
+echo extracting $x
+unzip -oq $x  
+done
+
+# gathering the genomes in a unique file
+rm  temp.fasta
+for y in $(ls ncbi_dataset/data/ | grep "GC" )
+do
+cat ncbi_dataset/data/$y/*.fna >> temp.fasta
+done
+
+# solving the return each 60 lines 
+awk '!/^>/ { printf "%s", $0; n = "\n" } /^>/ { print n $0; n = "" } END { printf "%s", n }' temp.fasta | cut -f 1-4 -d " " > bacteria_AGS_genomes.fasta
+
+sed -e "s/MAG: //g" -e "s/ /_/g" -i bacteria_AGS_genomes.fasta
+rm md5sum.txt README.md temp.fasta genome_* -r
+
+sed "s/Nostocoides/Tetrasphaera/g" -i bacteria_AGS_genomes.fasta    # name of Tetrasphaera in NCBI
+
+# grep -E "Moranbacteria|Accumulibacter|Competibacter|Zoogloea|Dechloromonas|Flavobacterium|Propionivibrio|Novosphingobium|Tetrasphaera|Thauera" -A 1 --no-group-separator bacteria_AGS_genomes.fasta > cleaned.temp
+# mv cleaned.temp bacteria_AGS_genomes.fasta   # overwriting the original file, now cleaned.
+
+
+
+
+##############     PREPARING THE ABUNDANCES FOR ISS     ##############
+
+
+# the simulator acts on each read as a genome/bacteria, hence a total read abundance for each group of reads (each taxon) has to be defined to mirror the real taxa abundances seen in AGS
+grep ">" bacteria_AGS_genomes.fasta > headers_names.txt
+
+R    # opening R here
+
+headers<- read.table(file="headers_names.txt")
+headers$V1<-gsub(">","",headers$V1)
+headers$abund<-rep("temp")
+
+target_abund<- c("Moranbacteria" = 0.10,"Accumulibacter" = 0.20,"Competibacter" = 0.20,"Dechloromonas" = 0.06,"Flavobacterium" = 0.10,"Propionivibrio" =0.05,"Zoogloea" = 0.05,"Novosphingobium"= 0.05,"Tetrasphaera" = 0.05, "Thauera" = 0.05)
+# these abundances mirror the relative abundances of these taxa in the true sample "LD39" (deriving from PCR) after excluding the other taxa to obtain a total equal to 1 (as required by ISS)
+for( x in names(target_abund) ){
+  which_reads <- grepl( x , headers$V1 )  # reads/genomes of that bacteria
+  how_many_reads <- length(which(which_reads))
+  splitted_abund <- target_abund[[x]] / how_many_reads
+  headers$abund [ which_reads ] <- splitted_abund
+}
+headers$abund <-  as.numeric(headers$abund)
+headers$abund <- headers$abund / sum(headers$abund)   # to ensure that the total is actually equal to 1
+
+write.table(headers, file= "Chosen_abund.tsv", col.names=F, row.names=F, quote=F, sep="\t")
+
+q("no")
+
+
+
+
+###################     SIMULATING THE SEQUENCING    ###############
+
+
+conda activate InSilicoSeq
+nohup iss generate --genomes bacteria_AGS_genomes.fasta --abundance_file Chosen_abund.tsv --model novaseq --cpu 60 --output mock_AGS_DNAseq --seed 1994  --compress --n_reads 140000000   &
+  # (n reads is 70000000 x 2, because iss counts the pairs as separate reads...)
+  
+mv mock_AGS_DNAseq_R1.fastq.gz mock_AGS_DNAseq_R1_001.fastq.gz
+mv mock_AGS_DNAseq_R2.fastq.gz mock_AGS_DNAseq_R2_001.fastq.gz
+
+
+# checking the produced abundances...
+rm true_abudances_of_mock.tsv
+for x in Candidatus_Accumulibacter Candidatus_Competibacter Candidatus_Moranbacteria Zoogloea Dechloromonas Flavobacterium Propionivibrio Novosphingobium Tetrasphaera
+do echo $x $(zcat mock_AGS_DNAseq_R1.fastq | grep $x -c)  >> true_abudances_of_DNAseq_mock.tsv
+done
+
+# rm headers_names.txt ncbi_dataset -r Chosen_abund.tsv bacteria_AGS_genomes.fasta
