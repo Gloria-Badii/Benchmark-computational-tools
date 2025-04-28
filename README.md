@@ -1,4 +1,4 @@
-# Benchmark of computational tools for taxonomic classification and ecological assessment applied to AGS reactors
+# Benchmark of computational tools for taxonomic classification and ecological assessment applied to Aerobic Granular Sludge (AGS) reactors
 
 Taxonomic identification and ecological assessment are crucial components of most microbiological studies, such as the analysis of Activated Sludge (AS) and Aerobic Granular Sludge (AGS) from waste waters. The AGS and AS techniques are innovative approaches, that render the depuration of polluted waters in Waste Water Treatment Plants (WWTP) more effective, eco-friendly, money and time-saving. Nevertheless, the results obtained from these metagenomic studies have been proven to be deeply influenced by the employed computational frameworks, in terms of sequencing approach, reference database and classifier.
 
