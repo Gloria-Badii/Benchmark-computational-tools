@@ -104,7 +104,7 @@ mv mock_AGS_DNAseq_R2.fastq.gz mock_AGS_DNAseq_R2_001.fastq.gz
 
 # checking the produced abundances...
 rm true_abudances_of_mock.tsv
-for x in Candidatus_Accumulibacter Candidatus_Competibacter Candidatus_Moranbacteria Zoogloea Dechloromonas Flavobacterium Propionivibrio Novosphingobium Tetrasphaera
+for x in Candidatus_Accumulibacter Candidatus_Competibacter Candidatus_Moranbacteria Zoogloea Dechloromonas Flavobacterium Propionivibrio Novosphingobium Tetrasphaera Thauera
 do echo $x $(zcat mock_AGS_DNAseq_R1.fastq | grep $x -c)  >> true_abudances_of_DNAseq_mock.tsv
 done
 
